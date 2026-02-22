@@ -34,6 +34,7 @@ Usage:
 
 Flags:
   -R, --repo <owner/repo>       Target repo (repeatable; default: configured repos or current)
+  -O, --org <org>               Target org (repeatable; scopes search to org)
   --since <date>                Since when (yesterday, monday..sunday, last-week, 2025-01-15)
       --json                    Output as JSON (for scripting)
   -h, --help                    Show help
@@ -53,8 +54,9 @@ func main() {
 		return
 	}
 
-	// Extract repo flags, --since, and --json from anywhere in args
+	// Extract repo flags, --org, --since, and --json from anywhere in args
 	var repos []string
+	var orgs []string
 	var cleanArgs []string
 	sinceArg := ""
 	jsonOutput := false
@@ -62,6 +64,9 @@ func main() {
 		if (os.Args[i] == "-R" || os.Args[i] == "--repo") && i+1 < len(os.Args) {
 			i++
 			repos = append(repos, os.Args[i])
+		} else if (os.Args[i] == "-O" || os.Args[i] == "--org") && i+1 < len(os.Args) {
+			i++
+			orgs = append(orgs, os.Args[i])
 		} else if os.Args[i] == "--since" && i+1 < len(os.Args) {
 			i++
 			sinceArg = os.Args[i]
@@ -104,11 +109,11 @@ func main() {
 		}
 		cmdStory(repo, pr, jsonOutput)
 	case "dashboard", "dash", "db":
-		cmdDashboard(repos, jsonOutput)
+		cmdDashboard(repos, orgs, jsonOutput)
 	case "standup", "su":
-		cmdStandup(repos, sinceArg, jsonOutput)
+		cmdStandup(repos, orgs, sinceArg, jsonOutput)
 	case "focus", "f":
-		cmdFocus(repos, jsonOutput)
+		cmdFocus(repos, orgs, jsonOutput)
 	case "review", "rv":
 		pr := ""
 		if len(cleanArgs) > 1 {
@@ -120,7 +125,7 @@ func main() {
 		}
 		cmdReview(repo, pr, jsonOutput)
 	case "blockers", "bl":
-		cmdBlockers(repos, jsonOutput)
+		cmdBlockers(repos, orgs, jsonOutput)
 	case "config":
 		cmdConfig(cleanArgs[1:])
 	case "-h", "--help", "help":
@@ -173,15 +178,15 @@ func cmdPicker(repos []string) {
 	case 2:
 		cmdStory(repo, "", false)
 	case 3:
-		cmdDashboard(repos, false)
+		cmdDashboard(repos, nil, false)
 	case 4:
-		cmdStandup(repos, "", false)
+		cmdStandup(repos, nil, "", false)
 	case 5:
-		cmdFocus(repos, false)
+		cmdFocus(repos, nil, false)
 	case 6:
 		cmdReview(repo, "", false)
 	case 7:
-		cmdBlockers(repos, false)
+		cmdBlockers(repos, nil, false)
 	}
 }
 
@@ -626,14 +631,30 @@ func catchUpFallback(repos []string) {
 		repoScope = " " + strings.Join(parts, " ")
 	}
 
-	// Search for recent mentions
-	mentionQuery := fmt.Sprintf("q=mentions:%s%s updated:>%s", user, repoScope, daysAgo(7))
-	out, err := exec.Command("gh", "api", "search/issues",
-		"-f", mentionQuery,
-		"--jq", `.items[:10] | .[] | "#" + (.number|tostring) + " " + .title + " (" + .repository_url + ")"`).Output()
-	if err == nil && len(out) > 0 {
+	// Fetch mentions and review requests concurrently
+	var mentionsOut, reviewOut []byte
+	var mentionsErr, reviewErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		mentionQuery := fmt.Sprintf("q=mentions:%s%s updated:>%s", user, repoScope, daysAgo(7))
+		mentionsOut, mentionsErr = exec.Command("gh", "api", "search/issues",
+			"-f", mentionQuery,
+			"--jq", `.items[:10] | .[] | "#" + (.number|tostring) + " " + .title + " (" + .repository_url + ")"`).Output()
+	}()
+	go func() {
+		defer wg.Done()
+		reviewQuery := fmt.Sprintf("q=type:pr review-requested:%s%s state:open", user, repoScope)
+		reviewOut, reviewErr = exec.Command("gh", "api", "search/issues",
+			"-f", reviewQuery,
+			"--jq", `.items[:10] | .[] | "#" + (.number|tostring) + " " + .title`).Output()
+	}()
+	wg.Wait()
+
+	if mentionsErr == nil && len(mentionsOut) > 0 {
 		fmt.Printf("  %sRecent mentions:%s\n", bold, reset)
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		for _, line := range strings.Split(strings.TrimSpace(string(mentionsOut)), "\n") {
 			if line != "" {
 				fmt.Printf("    %s\n", line)
 			}
@@ -642,14 +663,9 @@ func catchUpFallback(repos []string) {
 		fmt.Printf("  %sNo recent mentions found.%s\n", dim, reset)
 	}
 
-	// Search for PRs needing your review
-	reviewQuery := fmt.Sprintf("q=type:pr review-requested:%s%s state:open", user, repoScope)
-	out2, err := exec.Command("gh", "api", "search/issues",
-		"-f", reviewQuery,
-		"--jq", `.items[:10] | .[] | "#" + (.number|tostring) + " " + .title`).Output()
-	if err == nil && len(out2) > 0 {
+	if reviewErr == nil && len(reviewOut) > 0 {
 		fmt.Printf("\n  %sPRs awaiting your review:%s\n", bold, reset)
-		for _, line := range strings.Split(strings.TrimSpace(string(out2)), "\n") {
+		for _, line := range strings.Split(strings.TrimSpace(string(reviewOut)), "\n") {
 			if line != "" {
 				fmt.Printf("    %s\n", line)
 			}
@@ -1222,7 +1238,7 @@ type SearchIssue struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
-func cmdDashboard(repos []string, jsonOutput bool) {
+func cmdDashboard(repos, orgs []string, jsonOutput bool) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
@@ -1230,11 +1246,7 @@ func cmdDashboard(repos []string, jsonOutput bool) {
 	user := ghUser()
 	fmt.Printf("\n  %swut's on my plate?%s %s@%s%s\n\n", bold, reset, dim, user, reset)
 
-	// Build repo filter args for gh search
-	var repoArgs []string
-	for _, r := range repos {
-		repoArgs = append(repoArgs, "--repo", r)
-	}
+	scopeArgs := searchScopeArgs(repos, orgs)
 
 	// Fetch all three sections concurrently
 	var myPRs []SearchPR
@@ -1247,7 +1259,7 @@ func cmdDashboard(repos []string, jsonOutput bool) {
 		defer wg.Done()
 		args := []string{"search", "prs", "--author", user, "--state", "open",
 			"--limit", "15", "--json", "number,title,repository,url,isDraft,updatedAt"}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &myPRs)
@@ -1258,7 +1270,7 @@ func cmdDashboard(repos []string, jsonOutput bool) {
 		defer wg.Done()
 		args := []string{"search", "prs", "--review-requested", user, "--state", "open",
 			"--limit", "15", "--json", "number,title,repository,url,updatedAt"}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &reviewPRs)
@@ -1269,7 +1281,7 @@ func cmdDashboard(repos []string, jsonOutput bool) {
 		defer wg.Done()
 		args := []string{"search", "issues", "--assignee", user, "--state", "open",
 			"--limit", "15", "--json", "number,title,repository,url,updatedAt"}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &assignedIssues)
@@ -1364,13 +1376,10 @@ type FocusIssue struct {
 	} `json:"repository"`
 }
 
-func cmdFocus(repos []string, jsonOutput bool) {
+func cmdFocus(repos, orgs []string, jsonOutput bool) {
 	user := ghUser()
 
-	var repoArgs []string
-	for _, r := range repos {
-		repoArgs = append(repoArgs, "--repo", r)
-	}
+	scopeArgs := searchScopeArgs(repos, orgs)
 
 	var myPRs []FocusPR
 	var reviewPRs []FocusReviewPR
@@ -1383,7 +1392,7 @@ func cmdFocus(repos []string, jsonOutput bool) {
 		defer wg.Done()
 		args := []string{"search", "prs", "--author", user, "--state", "open",
 			"--limit", "30", "--json", "number,title,repository,statusCheckRollup"}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &myPRs)
@@ -1394,7 +1403,7 @@ func cmdFocus(repos []string, jsonOutput bool) {
 		defer wg.Done()
 		args := []string{"search", "prs", "--review-requested", user, "--state", "open",
 			"--limit", "15", "--json", "number,title,repository"}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &reviewPRs)
@@ -1406,7 +1415,7 @@ func cmdFocus(repos []string, jsonOutput bool) {
 		args := []string{"search", "prs", "--author", user, "--state", "open",
 			"--review", "none",
 			"--limit", "15", "--json", "number,title,repository,statusCheckRollup"}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &noReviewPRs)
@@ -1417,7 +1426,7 @@ func cmdFocus(repos []string, jsonOutput bool) {
 		defer wg.Done()
 		args := []string{"search", "issues", "--assignee", user, "--state", "open",
 			"--limit", "15", "--json", "number,title,repository"}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &assignedIssues)
@@ -1503,7 +1512,7 @@ type BlockerIssue struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
-func cmdBlockers(repos []string, jsonOutput bool) {
+func cmdBlockers(repos, orgs []string, jsonOutput bool) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	red := "\033[31m"
@@ -1516,10 +1525,7 @@ func cmdBlockers(repos []string, jsonOutput bool) {
 		fmt.Printf("\n  %swut's stuck?%s %s@%s%s\n\n", bold, reset, dim, user, reset)
 	}
 
-	var repoArgs []string
-	for _, r := range repos {
-		repoArgs = append(repoArgs, "--repo", r)
-	}
+	scopeArgs := searchScopeArgs(repos, orgs)
 
 	var myPRs []BlockerPR
 	var reviewRequestedPRs []BlockerPR
@@ -1531,7 +1537,7 @@ func cmdBlockers(repos []string, jsonOutput bool) {
 		defer wg.Done()
 		args := []string{"search", "prs", "--author", user, "--state", "open",
 			"--limit", "30", "--json", "number,title,repository,url,updatedAt"}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &myPRs)
@@ -1542,7 +1548,7 @@ func cmdBlockers(repos []string, jsonOutput bool) {
 		defer wg.Done()
 		args := []string{"search", "prs", "--review-requested", user, "--state", "open",
 			"--limit", "15", "--json", "number,title,repository,url,updatedAt"}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &reviewRequestedPRs)
@@ -1553,7 +1559,7 @@ func cmdBlockers(repos []string, jsonOutput bool) {
 		defer wg.Done()
 		args := []string{"search", "issues", "--assignee", user, "--state", "open",
 			"--limit", "15", "--json", "number,title,repository,url,updatedAt"}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &assignedIssues)
@@ -1691,11 +1697,22 @@ func cmdBlockers(repos []string, jsonOutput bool) {
 			yellow, pr.Number, truncate(pr.Title, 35), reset, dim, pr.Repository.NameWithOwner, age, reset)
 	}
 
-	// Section 4: Assigned issues with no linked PR
+	// Section 4: Assigned issues with no linked PR (check concurrently)
 	fmt.Printf("\n  %s📌 Issues with no linked PR:%s\n", bold, reset)
+	hasLinkedPR := make([]bool, len(assignedIssues))
+	var wg3 sync.WaitGroup
+	for i, issue := range assignedIssues {
+		wg3.Add(1)
+		go func(i int, repo string, number int) {
+			defer wg3.Done()
+			hasLinkedPR[i] = issueHasLinkedPR(repo, number)
+		}(i, issue.Repository.NameWithOwner, issue.Number)
+	}
+	wg3.Wait()
+
 	unlinkedFound := false
-	for _, issue := range assignedIssues {
-		if !issueHasLinkedPR(issue.Repository.NameWithOwner, issue.Number) {
+	for i, issue := range assignedIssues {
+		if !hasLinkedPR[i] {
 			unlinkedFound = true
 			age := timeAgo(issue.UpdatedAt)
 			fmt.Printf("    %s#%-6d %-35s%s  %s%-20s %s%s\n",
@@ -1720,6 +1737,18 @@ func issueHasLinkedPR(repo string, number int) bool {
 }
 
 // --- Helpers ---
+
+// searchScopeArgs builds --repo and --owner args for gh search commands.
+func searchScopeArgs(repos, orgs []string) []string {
+	var args []string
+	for _, r := range repos {
+		args = append(args, "--repo", r)
+	}
+	for _, o := range orgs {
+		args = append(args, "--owner", o)
+	}
+	return args
+}
 
 var (
 	cachedUser     string
@@ -1810,7 +1839,7 @@ func parseSince(s string) string {
 	return time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 }
 
-func cmdStandup(repos []string, sinceArg string, jsonOutput bool) {
+func cmdStandup(repos, orgs []string, sinceArg string, jsonOutput bool) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
@@ -1820,11 +1849,7 @@ func cmdStandup(repos []string, sinceArg string, jsonOutput bool) {
 
 	fmt.Printf("\n  %swut did I do?%s %s@%s since %s%s\n\n", bold, reset, dim, user, since, reset)
 
-	// Build repo filter args for gh search
-	var repoArgs []string
-	for _, r := range repos {
-		repoArgs = append(repoArgs, "--repo", r)
-	}
+	scopeArgs := searchScopeArgs(repos, orgs)
 
 	var mergedPRs []SearchPR
 	var closedIssues []SearchIssue
@@ -1842,7 +1867,7 @@ func cmdStandup(repos []string, sinceArg string, jsonOutput bool) {
 			"--sort", "updated", "--limit", "15",
 			"--json", "number,title,repository,url,isDraft,updatedAt",
 			"--", fmt.Sprintf("merged:>=%s", since)}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &mergedPRs)
@@ -1855,7 +1880,7 @@ func cmdStandup(repos []string, sinceArg string, jsonOutput bool) {
 			"--sort", "updated", "--limit", "15",
 			"--json", "number,title,repository,url,updatedAt",
 			"--", fmt.Sprintf("closed:>=%s", since)}
-		args = append(args, repoArgs...)
+		args = append(args, scopeArgs...)
 		out, err := exec.Command("gh", args...).Output()
 		if err == nil {
 			_ = json.Unmarshal(out, &closedIssues)
