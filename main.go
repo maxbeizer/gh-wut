@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -17,12 +18,12 @@ func usage() {
 Usage:
   gh wut                        Interactive picker
   gh wut context [-R repo]      Where was I? Open PRs, issues, recent commits
-  gh wut catch-up [-R repo]       What happened? Notification triage
-  gh wut story [pr-url]         Full PR story — issue, related PRs, CI
-  gh wut dashboard              Cross-repo: everything with your name on it
+  gh wut catch-up [-R repo]     What happened? Notification triage
+  gh wut story [-R repo] [pr]   Full PR story — issue, related PRs, CI
+  gh wut dashboard [-R repo]    Cross-repo: everything with your name on it
 
 Flags:
-  -R, --repo <owner/repo>       Target repo (default: current)
+  -R, --repo <owner/repo>       Target repo (repeatable; default: current)
   -h, --help                    Show help
   -v, --version                 Show version
 
@@ -32,40 +33,44 @@ Aliases: context|ctx, catch-up|catchup|cu, story|st, dashboard|dash|db
 
 func main() {
 	if len(os.Args) < 2 {
-		cmdPicker()
+		cmdPicker(nil)
 		return
 	}
 
-	// Extract repo flag from anywhere in args
-	repo := ""
+	// Extract repo flags from anywhere in args (supports multiple -R)
+	var repos []string
 	var cleanArgs []string
 	for i := 1; i < len(os.Args); i++ {
 		if (os.Args[i] == "-R" || os.Args[i] == "--repo") && i+1 < len(os.Args) {
 			i++
-			repo = os.Args[i]
+			repos = append(repos, os.Args[i])
 		} else {
 			cleanArgs = append(cleanArgs, os.Args[i])
 		}
 	}
 
 	if len(cleanArgs) == 0 {
-		cmdPicker()
+		cmdPicker(repos)
 		return
 	}
 
 	switch cleanArgs[0] {
 	case "context", "ctx":
-		cmdContext(repo)
+		cmdContext(repos)
 	case "catch-up", "catchup", "cu":
-		cmdCatchUp(repo)
+		cmdCatchUp(repos)
 	case "story", "st":
 		pr := ""
 		if len(cleanArgs) > 1 {
 			pr = cleanArgs[1]
 		}
+		repo := ""
+		if len(repos) > 0 {
+			repo = repos[0]
+		}
 		cmdStory(repo, pr)
 	case "dashboard", "dash", "db":
-		cmdDashboard()
+		cmdDashboard(repos)
 	case "-h", "--help", "help":
 		usage()
 	case "--completions":
@@ -85,7 +90,7 @@ func main() {
 
 // --- Interactive Picker ---
 
-func cmdPicker() {
+func cmdPicker(repos []string) {
 	fmt.Println("  wut?")
 	fmt.Println()
 	fmt.Println("  1) context    — Where was I?")
@@ -98,15 +103,20 @@ func cmdPicker() {
 	var choice string
 	fmt.Scanln(&choice)
 
+	repo := ""
+	if len(repos) > 0 {
+		repo = repos[0]
+	}
+
 	switch strings.TrimSpace(choice) {
 	case "1", "context":
-		cmdContext("")
+		cmdContext(repos)
 	case "2", "catch-up", "catchup":
-		cmdCatchUp("")
+		cmdCatchUp(repos)
 	case "3", "story":
-		cmdStory("", "")
+		cmdStory(repo, "")
 	case "4", "dashboard":
-		cmdDashboard()
+		cmdDashboard(repos)
 	default:
 		fmt.Fprintln(os.Stderr, "  ¯\\_(ツ)_/¯")
 	}
@@ -130,16 +140,24 @@ type Issue struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
-func cmdContext(repo string) {
-	if repo == "" {
-		repo = detectRepo()
-	}
-	if repo == "" {
-		fmt.Fprintln(os.Stderr, "Not in a repo. Use -R owner/repo")
-		os.Exit(1)
+func cmdContext(repos []string) {
+	if len(repos) == 0 {
+		r := detectRepo()
+		if r == "" {
+			fmt.Fprintln(os.Stderr, "Not in a repo. Use -R owner/repo")
+			os.Exit(1)
+		}
+		repos = []string{r}
 	}
 
 	user := ghUser()
+
+	for _, repo := range repos {
+		showContextForRepo(repo, user)
+	}
+}
+
+func showContextForRepo(repo, user string) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
@@ -242,32 +260,40 @@ type Notification struct {
 	Unread    bool   `json:"unread"`
 }
 
-func cmdCatchUp(repo string) {
+func cmdCatchUp(repos []string) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
 
 	fmt.Printf("\n  %swut happened?%s\n\n", bold, reset)
 
-	endpoint := "notifications?per_page=30"
-	if repo != "" {
-		endpoint = fmt.Sprintf("repos/%s/notifications?per_page=30", repo)
-	}
-	out, err := exec.Command("gh", "api", endpoint, "--paginate").Output()
-	if err != nil {
-		// Notifications API may not work with fine-grained PATs
-		fmt.Printf("  %sCouldn't fetch notifications.%s\n", dim, reset)
-		fmt.Printf("  %s(Notifications API requires classic PAT or OAuth token)%s\n\n", dim, reset)
-		fmt.Println("  Fallback: checking recent mentions...")
-		fmt.Println()
-		catchUpFallback(repo)
-		return
+	// If repos specified, fetch notifications per-repo; otherwise global
+	var allNotifs []Notification
+	if len(repos) > 0 {
+		for _, repo := range repos {
+			endpoint := fmt.Sprintf("repos/%s/notifications?per_page=30", repo)
+			out, err := exec.Command("gh", "api", endpoint, "--paginate").Output()
+			if err != nil {
+				continue
+			}
+			var notifs []Notification
+			_ = json.Unmarshal(out, &notifs)
+			allNotifs = append(allNotifs, notifs...)
+		}
+	} else {
+		out, err := exec.Command("gh", "api", "notifications?per_page=30", "--paginate").Output()
+		if err != nil {
+			fmt.Printf("  %sCouldn't fetch notifications.%s\n", dim, reset)
+			fmt.Printf("  %s(Notifications API requires classic PAT or OAuth token)%s\n\n", dim, reset)
+			fmt.Println("  Fallback: checking recent mentions...")
+			fmt.Println()
+			catchUpFallback(repos)
+			return
+		}
+		_ = json.Unmarshal(out, &allNotifs)
 	}
 
-	var notifs []Notification
-	_ = json.Unmarshal(out, &notifs)
-
-	if len(notifs) == 0 {
+	if len(allNotifs) == 0 {
 		fmt.Println("  Nothing new. Go touch grass.")
 		fmt.Println()
 		return
@@ -282,7 +308,7 @@ func cmdCatchUp(repo string) {
 		"other":            {},
 	}
 
-	for _, n := range notifs {
+	for _, n := range allNotifs {
 		switch n.Reason {
 		case "review_requested":
 			buckets["review_requested"] = append(buckets["review_requested"], n)
@@ -322,18 +348,25 @@ func cmdCatchUp(repo string) {
 	}
 }
 
-func catchUpFallback(repo string) {
+func catchUpFallback(repos []string) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
 
 	user := ghUser()
 
-	// Search for recent mentions
-	mentionQuery := fmt.Sprintf("q=mentions:%s updated:>%s", user, daysAgo(7))
-	if repo != "" {
-		mentionQuery = fmt.Sprintf("q=mentions:%s repo:%s updated:>%s", user, repo, daysAgo(7))
+	// Build repo scope for search queries
+	repoScope := ""
+	if len(repos) > 0 {
+		var parts []string
+		for _, r := range repos {
+			parts = append(parts, "repo:"+r)
+		}
+		repoScope = " " + strings.Join(parts, " ")
 	}
+
+	// Search for recent mentions
+	mentionQuery := fmt.Sprintf("q=mentions:%s%s updated:>%s", user, repoScope, daysAgo(7))
 	out, err := exec.Command("gh", "api", "search/issues",
 		"-f", mentionQuery,
 		"--jq", `.items[:10] | .[] | "#" + (.number|tostring) + " " + .title + " (" + .repository_url + ")"`).Output()
@@ -349,10 +382,7 @@ func catchUpFallback(repo string) {
 	}
 
 	// Search for PRs needing your review
-	reviewQuery := fmt.Sprintf("q=type:pr review-requested:%s state:open", user)
-	if repo != "" {
-		reviewQuery = fmt.Sprintf("q=type:pr review-requested:%s repo:%s state:open", user, repo)
-	}
+	reviewQuery := fmt.Sprintf("q=type:pr review-requested:%s%s state:open", user, repoScope)
 	out2, err := exec.Command("gh", "api", "search/issues",
 		"-f", reviewQuery,
 		"--jq", `.items[:10] | .[] | "#" + (.number|tostring) + " " + .title`).Output()
@@ -455,28 +485,50 @@ func cmdStory(repo, prRef string) {
 		fmt.Printf("%s? %s%s\n", yellow, pr.Mergeable, reset)
 	}
 
-	// CI Status
+	// CI Status — summary + failures only
 	fmt.Printf("\n  %sChecks:%s\n", bold, reset)
 	if len(pr.StatusCheckRollup) == 0 {
 		fmt.Printf("    %s(none)%s\n", dim, reset)
-	}
-	for _, check := range pr.StatusCheckRollup {
-		icon := "·"
-		color := dim
-		switch check.Conclusion {
-		case "SUCCESS":
-			icon = "✓"
-			color = green
-		case "FAILURE":
-			icon = "✗"
-			color = red
-		case "":
-			if check.Status == "IN_PROGRESS" {
-				icon = "◌"
-				color = yellow
+	} else {
+		pass, fail, pending := 0, 0, 0
+		var failures []string
+		for _, check := range pr.StatusCheckRollup {
+			switch check.Conclusion {
+			case "SUCCESS":
+				pass++
+			case "FAILURE":
+				fail++
+				failures = append(failures, check.Name)
+			default:
+				if check.Status == "IN_PROGRESS" || check.Status == "QUEUED" || check.Status == "PENDING" {
+					pending++
+				} else if check.Conclusion == "" && check.Status == "" {
+					pending++
+				} else {
+					pass++ // NEUTRAL, SKIPPED, etc.
+				}
 			}
 		}
-		fmt.Printf("    %s%s%s %s\n", color, icon, reset, check.Name)
+		// Summary line
+		var summary []string
+		if pass > 0 {
+			summary = append(summary, fmt.Sprintf("%s%d✓%s", green, pass, reset))
+		}
+		if fail > 0 {
+			summary = append(summary, fmt.Sprintf("%s%d✗%s", red, fail, reset))
+		}
+		if pending > 0 {
+			summary = append(summary, fmt.Sprintf("%s%d◌%s", yellow, pending, reset))
+		}
+		fmt.Printf("    %s\n", strings.Join(summary, "  "))
+
+		// Only show failures
+		if len(failures) > 0 {
+			fmt.Printf("\n    %sFailing:%s\n", bold, reset)
+			for _, name := range failures {
+				fmt.Printf("      %s✗%s %s\n", red, reset, name)
+			}
+		}
 	}
 
 	// Reviews
@@ -526,35 +578,57 @@ func cmdStory(repo, prRef string) {
 	fmt.Println()
 }
 
+var issueRefRe = regexp.MustCompile(`(?:^|\s)#(\d+)`)
+var issueURLRe = regexp.MustCompile(`https?://github\.com/[^\s/]+/[^\s/]+/(?:issues|pull)/\d+`)
+
 func findLinkedIssues(body string) []string {
 	var refs []string
 	seen := map[string]bool{}
 
-	// Match patterns like: fixes #123, closes #456, resolves #789, #123
-	words := strings.Fields(body)
-	for _, w := range words {
-		w = strings.TrimRight(w, ".,;:!?)")
-		if strings.HasPrefix(w, "#") && len(w) > 1 {
-			if !seen[w] {
-				refs = append(refs, w)
-				seen[w] = true
-			}
-		}
-		// Also match full URLs
-		if strings.Contains(w, "/issues/") || strings.Contains(w, "/pull/") {
-			w = strings.TrimLeft(w, "(")
-			if !seen[w] {
-				refs = append(refs, w)
-				seen[w] = true
-			}
+	// Match #123 style refs (but not ## markdown headers)
+	for _, m := range issueRefRe.FindAllStringSubmatch(body, -1) {
+		ref := "#" + m[1]
+		if !seen[ref] {
+			refs = append(refs, ref)
+			seen[ref] = true
 		}
 	}
+
+	// Match full GitHub URLs
+	for _, url := range issueURLRe.FindAllString(body, -1) {
+		if !seen[url] {
+			refs = append(refs, url)
+			seen[url] = true
+		}
+	}
+
 	return refs
 }
 
 // --- Dashboard: Cross-repo overview ---
 
-func cmdDashboard() {
+type SearchPR struct {
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	Repository struct {
+		NameWithOwner string `json:"nameWithOwner"`
+	} `json:"repository"`
+	URL       string `json:"url"`
+	IsDraft   bool   `json:"isDraft"`
+	UpdatedAt string `json:"updatedAt"`
+}
+
+type SearchIssue struct {
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	Repository struct {
+		NameWithOwner string `json:"nameWithOwner"`
+	} `json:"repository"`
+	URL       string `json:"url"`
+	UpdatedAt string `json:"updatedAt"`
+}
+
+func cmdDashboard(repos []string) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
@@ -562,35 +636,75 @@ func cmdDashboard() {
 	user := ghUser()
 	fmt.Printf("\n  %swut's on my plate?%s %s@%s%s\n\n", bold, reset, dim, user, reset)
 
+	// Build repo filter args for gh search
+	var repoArgs []string
+	for _, r := range repos {
+		repoArgs = append(repoArgs, "--repo", r)
+	}
+
 	// Open PRs you authored
 	fmt.Printf("  %sYour open PRs:%s\n", bold, reset)
-	out, err := exec.Command("gh", "api", "search/issues",
-		"-f", fmt.Sprintf("q=type:pr author:%s state:open", user),
-		"--jq", `.items[:15] | .[] | "    #" + (.number|tostring) + "  " + (.title|.[0:40]) + "  \u001b[2m" + (.repository_url | split("/") | .[-2:] | join("/")) + "\u001b[0m"`).Output()
-	if err == nil && len(strings.TrimSpace(string(out))) > 0 {
-		fmt.Println(strings.TrimSpace(string(out)))
+	prArgs := []string{"search", "prs", "--author", user, "--state", "open",
+		"--limit", "15", "--json", "number,title,repository,url,isDraft,updatedAt"}
+	prArgs = append(prArgs, repoArgs...)
+	out, err := exec.Command("gh", prArgs...).Output()
+	if err == nil {
+		var prs []SearchPR
+		_ = json.Unmarshal(out, &prs)
+		if len(prs) == 0 {
+			fmt.Printf("    %s(none)%s\n", dim, reset)
+		}
+		for _, pr := range prs {
+			draft := ""
+			if pr.IsDraft {
+				draft = " [draft]"
+			}
+			age := timeAgo(pr.UpdatedAt)
+			fmt.Printf("    #%-6d %-35s %s%-20s %s%s%s\n",
+				pr.Number, truncate(pr.Title, 35), dim, pr.Repository.NameWithOwner, age, draft, reset)
+		}
 	} else {
 		fmt.Printf("    %s(none)%s\n", dim, reset)
 	}
 
 	// PRs awaiting your review
 	fmt.Printf("\n  %sAwaiting your review:%s\n", bold, reset)
-	out2, err := exec.Command("gh", "api", "search/issues",
-		"-f", fmt.Sprintf("q=type:pr review-requested:%s state:open", user),
-		"--jq", `.items[:15] | .[] | "    #" + (.number|tostring) + "  " + (.title|.[0:40]) + "  \u001b[2m" + (.repository_url | split("/") | .[-2:] | join("/")) + "\u001b[0m"`).Output()
-	if err == nil && len(strings.TrimSpace(string(out2))) > 0 {
-		fmt.Println(strings.TrimSpace(string(out2)))
+	revArgs := []string{"search", "prs", "--review-requested", user, "--state", "open",
+		"--limit", "15", "--json", "number,title,repository,url,updatedAt"}
+	revArgs = append(revArgs, repoArgs...)
+	out2, err := exec.Command("gh", revArgs...).Output()
+	if err == nil {
+		var prs []SearchPR
+		_ = json.Unmarshal(out2, &prs)
+		if len(prs) == 0 {
+			fmt.Printf("    %s(none)%s\n", dim, reset)
+		}
+		for _, pr := range prs {
+			age := timeAgo(pr.UpdatedAt)
+			fmt.Printf("    #%-6d %-35s %s%-20s %s%s\n",
+				pr.Number, truncate(pr.Title, 35), dim, pr.Repository.NameWithOwner, age, reset)
+		}
 	} else {
 		fmt.Printf("    %s(none)%s\n", dim, reset)
 	}
 
 	// Your assigned issues
 	fmt.Printf("\n  %sAssigned to you:%s\n", bold, reset)
-	out3, err := exec.Command("gh", "api", "search/issues",
-		"-f", fmt.Sprintf("q=type:issue assignee:%s state:open", user),
-		"--jq", `.items[:15] | .[] | "    #" + (.number|tostring) + "  " + (.title|.[0:40]) + "  \u001b[2m" + (.repository_url | split("/") | .[-2:] | join("/")) + "\u001b[0m"`).Output()
-	if err == nil && len(strings.TrimSpace(string(out3))) > 0 {
-		fmt.Println(strings.TrimSpace(string(out3)))
+	issueArgs := []string{"search", "issues", "--assignee", user, "--state", "open",
+		"--limit", "15", "--json", "number,title,repository,url,updatedAt"}
+	issueArgs = append(issueArgs, repoArgs...)
+	out3, err := exec.Command("gh", issueArgs...).Output()
+	if err == nil {
+		var issues []SearchIssue
+		_ = json.Unmarshal(out3, &issues)
+		if len(issues) == 0 {
+			fmt.Printf("    %s(none)%s\n", dim, reset)
+		}
+		for _, issue := range issues {
+			age := timeAgo(issue.UpdatedAt)
+			fmt.Printf("    #%-6d %-35s %s%-20s %s%s\n",
+				issue.Number, truncate(issue.Title, 35), dim, issue.Repository.NameWithOwner, age, reset)
+		}
 	} else {
 		fmt.Printf("    %s(none)%s\n", dim, reset)
 	}
