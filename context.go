@@ -157,7 +157,7 @@ func listIssues(repo, user string) []Issue {
 
 func recentCommits(repo, user string) []string {
 	out, err := exec.Command("gh", "api", fmt.Sprintf("repos/%s/commits?author=%s&per_page=5", repo, user),
-		"--jq", `.[] | "  " + (.commit.message | split("\n")[0] | .[0:55]) + "  \u001b[2m" + (.commit.author.date | .[0:10]) + "\u001b[0m"`).Output()
+		"--jq", `.[] | (.commit.message | split("\n")[0] | .[0:55]) + "  \u001b[2m" + (.commit.author.date | .[0:10]) + "\u001b[0m"`).Output()
 	if err != nil {
 		return nil
 	}
