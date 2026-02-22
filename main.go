@@ -7,7 +7,10 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/cli/go-gh/v2/pkg/prompter"
 )
 
 const version = "0.1.0"
@@ -91,34 +94,33 @@ func main() {
 // --- Interactive Picker ---
 
 func cmdPicker(repos []string) {
-	fmt.Println("  wut?")
-	fmt.Println()
-	fmt.Println("  1) context    — Where was I?")
-	fmt.Println("  2) catch-up   — What happened while I was gone?")
-	fmt.Println("  3) story      — Full PR story")
-	fmt.Println("  4) dashboard  — Everything, everywhere")
-	fmt.Println()
-	fmt.Print("  Choose [1-4]: ")
+	p := prompter.New(os.Stdin, os.Stdout, os.Stderr)
+	options := []string{
+		"context    — Where was I?",
+		"catch-up   — What happened while I was gone?",
+		"story      — Full PR story",
+		"dashboard  — Everything, everywhere",
+	}
 
-	var choice string
-	fmt.Scanln(&choice)
+	idx, err := p.Select("wut?", "", options)
+	if err != nil {
+		return
+	}
 
 	repo := ""
 	if len(repos) > 0 {
 		repo = repos[0]
 	}
 
-	switch strings.TrimSpace(choice) {
-	case "1", "context":
+	switch idx {
+	case 0:
 		cmdContext(repos)
-	case "2", "catch-up", "catchup":
+	case 1:
 		cmdCatchUp(repos)
-	case "3", "story":
+	case 2:
 		cmdStory(repo, "")
-	case "4", "dashboard":
+	case 3:
 		cmdDashboard(repos)
-	default:
-		fmt.Fprintln(os.Stderr, "  ¯\\_(ツ)_/¯")
 	}
 }
 
@@ -170,9 +172,19 @@ func showContextForRepo(repo, user string) {
 		fmt.Printf("  On branch: %s%s%s\n\n", bold, branch, reset)
 	}
 
+	// Fetch PRs, issues, and commits concurrently
+	var prs []PR
+	var issues []Issue
+	var commits []string
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); prs = listPRs(repo, user) }()
+	go func() { defer wg.Done(); issues = listIssues(repo, user) }()
+	go func() { defer wg.Done(); commits = recentCommits(repo, user) }()
+	wg.Wait()
+
 	// Your open PRs
 	fmt.Printf("  %sYour open PRs:%s\n", bold, reset)
-	prs := listPRs(repo, user)
 	if len(prs) == 0 {
 		fmt.Printf("    %s(none)%s\n", dim, reset)
 	}
@@ -187,7 +199,6 @@ func showContextForRepo(repo, user string) {
 
 	// Your assigned issues
 	fmt.Printf("\n  %sAssigned issues:%s\n", bold, reset)
-	issues := listIssues(repo, user)
 	if len(issues) == 0 {
 		fmt.Printf("    %s(none)%s\n", dim, reset)
 	}
@@ -198,7 +209,6 @@ func showContextForRepo(repo, user string) {
 
 	// Recent commits by you
 	fmt.Printf("\n  %sYour recent commits:%s\n", bold, reset)
-	commits := recentCommits(repo, user)
 	if len(commits) == 0 {
 		fmt.Printf("    %s(none)%s\n", dim, reset)
 	}
@@ -267,18 +277,29 @@ func cmdCatchUp(repos []string) {
 
 	fmt.Printf("\n  %swut happened?%s\n\n", bold, reset)
 
-	// If repos specified, fetch notifications per-repo; otherwise global
+	// If repos specified, fetch notifications per-repo concurrently; otherwise global
 	var allNotifs []Notification
 	if len(repos) > 0 {
-		for _, repo := range repos {
-			endpoint := fmt.Sprintf("repos/%s/notifications?per_page=30", repo)
-			out, err := exec.Command("gh", "api", endpoint, "--paginate").Output()
-			if err != nil {
-				continue
-			}
-			var notifs []Notification
-			_ = json.Unmarshal(out, &notifs)
-			allNotifs = append(allNotifs, notifs...)
+		type result struct{ notifs []Notification }
+		results := make([]result, len(repos))
+		var wg sync.WaitGroup
+		for i, repo := range repos {
+			wg.Add(1)
+			go func(i int, repo string) {
+				defer wg.Done()
+				endpoint := fmt.Sprintf("repos/%s/notifications?per_page=30", repo)
+				out, err := exec.Command("gh", "api", endpoint, "--paginate").Output()
+				if err != nil {
+					return
+				}
+				var notifs []Notification
+				_ = json.Unmarshal(out, &notifs)
+				results[i] = result{notifs}
+			}(i, repo)
+		}
+		wg.Wait()
+		for _, r := range results {
+			allNotifs = append(allNotifs, r.notifs...)
 		}
 	} else {
 		out, err := exec.Command("gh", "api", "notifications?per_page=30", "--paginate").Output()
@@ -440,8 +461,8 @@ func cmdStory(repo, prRef string) {
 	}
 
 	if prRef == "" {
-		fmt.Print("  PR number or URL: ")
-		fmt.Scanln(&prRef)
+		p := prompter.New(os.Stdin, os.Stdout, os.Stderr)
+		prRef, _ = p.Input("PR number or URL", "")
 		prRef = strings.TrimSpace(prRef)
 	}
 
@@ -642,71 +663,81 @@ func cmdDashboard(repos []string) {
 		repoArgs = append(repoArgs, "--repo", r)
 	}
 
-	// Open PRs you authored
+	// Fetch all three sections concurrently
+	var myPRs []SearchPR
+	var reviewPRs []SearchPR
+	var assignedIssues []SearchIssue
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		args := []string{"search", "prs", "--author", user, "--state", "open",
+			"--limit", "15", "--json", "number,title,repository,url,isDraft,updatedAt"}
+		args = append(args, repoArgs...)
+		out, err := exec.Command("gh", args...).Output()
+		if err == nil {
+			_ = json.Unmarshal(out, &myPRs)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		args := []string{"search", "prs", "--review-requested", user, "--state", "open",
+			"--limit", "15", "--json", "number,title,repository,url,updatedAt"}
+		args = append(args, repoArgs...)
+		out, err := exec.Command("gh", args...).Output()
+		if err == nil {
+			_ = json.Unmarshal(out, &reviewPRs)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		args := []string{"search", "issues", "--assignee", user, "--state", "open",
+			"--limit", "15", "--json", "number,title,repository,url,updatedAt"}
+		args = append(args, repoArgs...)
+		out, err := exec.Command("gh", args...).Output()
+		if err == nil {
+			_ = json.Unmarshal(out, &assignedIssues)
+		}
+	}()
+
+	wg.Wait()
+
+	// Print results in consistent order
 	fmt.Printf("  %sYour open PRs:%s\n", bold, reset)
-	prArgs := []string{"search", "prs", "--author", user, "--state", "open",
-		"--limit", "15", "--json", "number,title,repository,url,isDraft,updatedAt"}
-	prArgs = append(prArgs, repoArgs...)
-	out, err := exec.Command("gh", prArgs...).Output()
-	if err == nil {
-		var prs []SearchPR
-		_ = json.Unmarshal(out, &prs)
-		if len(prs) == 0 {
-			fmt.Printf("    %s(none)%s\n", dim, reset)
-		}
-		for _, pr := range prs {
-			draft := ""
-			if pr.IsDraft {
-				draft = " [draft]"
-			}
-			age := timeAgo(pr.UpdatedAt)
-			fmt.Printf("    #%-6d %-35s %s%-20s %s%s%s\n",
-				pr.Number, truncate(pr.Title, 35), dim, pr.Repository.NameWithOwner, age, draft, reset)
-		}
-	} else {
+	if len(myPRs) == 0 {
 		fmt.Printf("    %s(none)%s\n", dim, reset)
 	}
+	for _, pr := range myPRs {
+		draft := ""
+		if pr.IsDraft {
+			draft = " [draft]"
+		}
+		age := timeAgo(pr.UpdatedAt)
+		fmt.Printf("    #%-6d %-35s %s%-20s %s%s%s\n",
+			pr.Number, truncate(pr.Title, 35), dim, pr.Repository.NameWithOwner, age, draft, reset)
+	}
 
-	// PRs awaiting your review
 	fmt.Printf("\n  %sAwaiting your review:%s\n", bold, reset)
-	revArgs := []string{"search", "prs", "--review-requested", user, "--state", "open",
-		"--limit", "15", "--json", "number,title,repository,url,updatedAt"}
-	revArgs = append(revArgs, repoArgs...)
-	out2, err := exec.Command("gh", revArgs...).Output()
-	if err == nil {
-		var prs []SearchPR
-		_ = json.Unmarshal(out2, &prs)
-		if len(prs) == 0 {
-			fmt.Printf("    %s(none)%s\n", dim, reset)
-		}
-		for _, pr := range prs {
-			age := timeAgo(pr.UpdatedAt)
-			fmt.Printf("    #%-6d %-35s %s%-20s %s%s\n",
-				pr.Number, truncate(pr.Title, 35), dim, pr.Repository.NameWithOwner, age, reset)
-		}
-	} else {
+	if len(reviewPRs) == 0 {
 		fmt.Printf("    %s(none)%s\n", dim, reset)
 	}
+	for _, pr := range reviewPRs {
+		age := timeAgo(pr.UpdatedAt)
+		fmt.Printf("    #%-6d %-35s %s%-20s %s%s\n",
+			pr.Number, truncate(pr.Title, 35), dim, pr.Repository.NameWithOwner, age, reset)
+	}
 
-	// Your assigned issues
 	fmt.Printf("\n  %sAssigned to you:%s\n", bold, reset)
-	issueArgs := []string{"search", "issues", "--assignee", user, "--state", "open",
-		"--limit", "15", "--json", "number,title,repository,url,updatedAt"}
-	issueArgs = append(issueArgs, repoArgs...)
-	out3, err := exec.Command("gh", issueArgs...).Output()
-	if err == nil {
-		var issues []SearchIssue
-		_ = json.Unmarshal(out3, &issues)
-		if len(issues) == 0 {
-			fmt.Printf("    %s(none)%s\n", dim, reset)
-		}
-		for _, issue := range issues {
-			age := timeAgo(issue.UpdatedAt)
-			fmt.Printf("    #%-6d %-35s %s%-20s %s%s\n",
-				issue.Number, truncate(issue.Title, 35), dim, issue.Repository.NameWithOwner, age, reset)
-		}
-	} else {
+	if len(assignedIssues) == 0 {
 		fmt.Printf("    %s(none)%s\n", dim, reset)
+	}
+	for _, issue := range assignedIssues {
+		age := timeAgo(issue.UpdatedAt)
+		fmt.Printf("    #%-6d %-35s %s%-20s %s%s\n",
+			issue.Number, truncate(issue.Title, 35), dim, issue.Repository.NameWithOwner, age, reset)
 	}
 
 	fmt.Println()
