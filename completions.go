@@ -9,7 +9,7 @@ import (
 func GenerateBashCompletion() string {
 	return `_gh_wut() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local commands="context ctx catch-up catchup cu story st dashboard dash db help version"
+    local commands="context ctx catch-up catchup cu story st dashboard dash db standup su focus f review rv blockers bl help version"
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
 }
 complete -F _gh_wut "gh-wut"
@@ -34,6 +34,14 @@ _gh_wut() {
         'dashboard:Cross-repo: everything with your name on it'
         'dash:Alias for dashboard'
         'db:Alias for dashboard'
+        'standup:What did I do? Merged PRs, closed issues, commits'
+        'su:Alias for standup'
+        'focus:Just tell me what to do next'
+        'f:Alias for focus'
+        'review:Reviewer-focused PR view'
+        'rv:Alias for review'
+        'blockers:What'\''s stuck? Failing CI, awaiting review'
+        'bl:Alias for blockers'
     )
     _describe 'command' commands
 }
@@ -54,6 +62,14 @@ complete -c gh-wut -n '__fish_use_subcommand' -a st -d 'Alias for story'
 complete -c gh-wut -n '__fish_use_subcommand' -a dashboard -d 'Cross-repo overview'
 complete -c gh-wut -n '__fish_use_subcommand' -a dash -d 'Alias for dashboard'
 complete -c gh-wut -n '__fish_use_subcommand' -a db -d 'Alias for dashboard'
+complete -c gh-wut -n '__fish_use_subcommand' -a standup -d 'What did I do?'
+complete -c gh-wut -n '__fish_use_subcommand' -a su -d 'Alias for standup'
+complete -c gh-wut -n '__fish_use_subcommand' -a focus -d 'Just tell me what to do next'
+complete -c gh-wut -n '__fish_use_subcommand' -a f -d 'Alias for focus'
+complete -c gh-wut -n '__fish_use_subcommand' -a review -d 'Reviewer-focused PR view'
+complete -c gh-wut -n '__fish_use_subcommand' -a rv -d 'Alias for review'
+complete -c gh-wut -n '__fish_use_subcommand' -a blockers -d 'What'\''s stuck?'
+complete -c gh-wut -n '__fish_use_subcommand' -a bl -d 'Alias for blockers'
 `
 }
 
