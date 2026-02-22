@@ -37,6 +37,7 @@ Flags:
   -R, --repo <owner/repo>       Target repo (repeatable; default: configured repos or current)
   -O, --org <org>               Target org (repeatable; scopes search to org)
   --since <date>                Since when (yesterday, monday..sunday, last-week, 2025-01-15)
+  -i, --interactive             Show selection prompt to open items in browser
       --json                    Output as JSON (for scripting)
   -h, --help                    Show help
   -v, --version                 Show version
@@ -48,7 +49,7 @@ Aliases: context|ctx, catch-up|catchup|cu, story|st, dashboard|dash|db, standup|
 func main() {
 	if len(os.Args) < 2 {
 		if r := detectRepo(); r != "" {
-			cmdContext([]string{r}, false)
+			cmdContext([]string{r}, false, false)
 		} else {
 			cmdPicker(nil)
 		}
@@ -61,6 +62,7 @@ func main() {
 	var cleanArgs []string
 	sinceArg := ""
 	jsonOutput := false
+	interactive := false
 	for i := 1; i < len(os.Args); i++ {
 		if (os.Args[i] == "-R" || os.Args[i] == "--repo") && i+1 < len(os.Args) {
 			i++
@@ -73,6 +75,8 @@ func main() {
 			sinceArg = os.Args[i]
 		} else if os.Args[i] == "--json" {
 			jsonOutput = true
+		} else if os.Args[i] == "-i" || os.Args[i] == "--interactive" {
+			interactive = true
 		} else {
 			cleanArgs = append(cleanArgs, os.Args[i])
 		}
@@ -85,9 +89,9 @@ func main() {
 
 	if len(cleanArgs) == 0 {
 		if len(repos) > 0 {
-			cmdContext(repos, jsonOutput)
+			cmdContext(repos, jsonOutput, interactive)
 		} else if r := detectRepo(); r != "" {
-			cmdContext([]string{r}, jsonOutput)
+			cmdContext([]string{r}, jsonOutput, interactive)
 		} else {
 			cmdPicker(repos)
 		}
@@ -96,7 +100,7 @@ func main() {
 
 	switch cleanArgs[0] {
 	case "context", "ctx":
-		cmdContext(repos, jsonOutput)
+		cmdContext(repos, jsonOutput, interactive)
 	case "catch-up", "catchup", "cu":
 		cmdCatchUp(repos, jsonOutput)
 	case "story", "st":
@@ -110,7 +114,7 @@ func main() {
 		}
 		cmdStory(repo, pr, jsonOutput)
 	case "dashboard", "dash", "db":
-		cmdDashboard(repos, orgs, jsonOutput)
+		cmdDashboard(repos, orgs, jsonOutput, interactive)
 	case "standup", "su":
 		cmdStandup(repos, orgs, sinceArg, jsonOutput)
 	case "focus", "f":
@@ -126,7 +130,7 @@ func main() {
 		}
 		cmdReview(repo, pr, jsonOutput)
 	case "blockers", "bl":
-		cmdBlockers(repos, orgs, jsonOutput)
+		cmdBlockers(repos, orgs, jsonOutput, interactive)
 	case "config":
 		cmdConfig(cleanArgs[1:])
 	case "-h", "--help", "help":
@@ -173,13 +177,13 @@ func cmdPicker(repos []string) {
 
 	switch idx {
 	case 0:
-		cmdContext(repos, false)
+		cmdContext(repos, false, false)
 	case 1:
 		cmdCatchUp(repos, false)
 	case 2:
 		cmdStory(repo, "", false)
 	case 3:
-		cmdDashboard(repos, nil, false)
+		cmdDashboard(repos, nil, false, false)
 	case 4:
 		cmdStandup(repos, nil, "", false)
 	case 5:
@@ -187,7 +191,7 @@ func cmdPicker(repos []string) {
 	case 6:
 		cmdReview(repo, "", false)
 	case 7:
-		cmdBlockers(repos, nil, false)
+		cmdBlockers(repos, nil, false, false)
 	}
 }
 
@@ -313,7 +317,7 @@ type Issue struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
-func cmdContext(repos []string, jsonOutput bool) {
+func cmdContext(repos []string, jsonOutput, interactive bool) {
 	if len(repos) == 0 {
 		r := detectRepo()
 		if r == "" {
@@ -342,7 +346,7 @@ func cmdContext(repos []string, jsonOutput bool) {
 	for _, repo := range repos {
 		allItems = append(allItems, showContextForRepo(repo, user)...)
 	}
-	offerSelection(allItems)
+	offerSelection(allItems, interactive)
 }
 
 func showContextForRepo(repo, user string) []selectableItem {
@@ -1257,7 +1261,7 @@ type SearchIssue struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
-func cmdDashboard(repos, orgs []string, jsonOutput bool) {
+func cmdDashboard(repos, orgs []string, jsonOutput, interactive bool) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
@@ -1384,7 +1388,7 @@ func cmdDashboard(repos, orgs []string, jsonOutput bool) {
 			URL:   issue.URL,
 		})
 	}
-	offerSelection(items)
+	offerSelection(items, interactive)
 }
 
 // --- Focus: Just tell me what to do next ---
@@ -1553,7 +1557,7 @@ type BlockerIssue struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
-func cmdBlockers(repos, orgs []string, jsonOutput bool) {
+func cmdBlockers(repos, orgs []string, jsonOutput, interactive bool) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	red := "\033[31m"
@@ -1800,7 +1804,7 @@ func cmdBlockers(repos, orgs []string, jsonOutput bool) {
 			})
 		}
 	}
-	offerSelection(items)
+	offerSelection(items, interactive)
 }
 
 func issueHasLinkedPR(repo string, number int) bool {
@@ -1899,8 +1903,8 @@ type selectableItem struct {
 
 // offerSelection shows an interactive select prompt and opens the chosen item.
 // Only shows when running in a terminal. Can be called repeatedly until user exits.
-func offerSelection(items []selectableItem) {
-	if !isInteractive() || len(items) == 0 {
+func offerSelection(items []selectableItem, interactive bool) {
+	if !interactive || !isInteractive() || len(items) == 0 {
 		return
 	}
 
