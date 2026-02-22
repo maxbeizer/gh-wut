@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cli/go-gh/v2/pkg/prompter"
+	"golang.org/x/term"
 )
 
 const version = "0.1.0"
@@ -337,12 +338,14 @@ func cmdContext(repos []string, jsonOutput bool) {
 		return
 	}
 
+	var allItems []selectableItem
 	for _, repo := range repos {
-		showContextForRepo(repo, user)
+		allItems = append(allItems, showContextForRepo(repo, user)...)
 	}
+	offerSelection(allItems)
 }
 
-func showContextForRepo(repo, user string) {
+func showContextForRepo(repo, user string) []selectableItem {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
@@ -400,6 +403,22 @@ func showContextForRepo(repo, user string) {
 	}
 
 	fmt.Println()
+
+	// Build selectable items
+	var items []selectableItem
+	for _, pr := range prs {
+		items = append(items, selectableItem{
+			Label: fmt.Sprintf("PR #%d  %s", pr.Number, truncate(pr.Title, 45)),
+			URL:   pr.URL,
+		})
+	}
+	for _, issue := range issues {
+		items = append(items, selectableItem{
+			Label: fmt.Sprintf("Issue #%d  %s", issue.Number, truncate(issue.Title, 45)),
+			URL:   issue.URL,
+		})
+	}
+	return items
 }
 
 func listPRs(repo, user string) []PR {
@@ -1344,6 +1363,28 @@ func cmdDashboard(repos, orgs []string, jsonOutput bool) {
 	}
 
 	fmt.Println()
+
+	// Interactive selection
+	var items []selectableItem
+	for _, pr := range myPRs {
+		items = append(items, selectableItem{
+			Label: fmt.Sprintf("PR #%d  %s  (%s)", pr.Number, truncate(pr.Title, 40), pr.Repository.NameWithOwner),
+			URL:   pr.URL,
+		})
+	}
+	for _, pr := range reviewPRs {
+		items = append(items, selectableItem{
+			Label: fmt.Sprintf("Review #%d  %s  (%s)", pr.Number, truncate(pr.Title, 40), pr.Repository.NameWithOwner),
+			URL:   pr.URL,
+		})
+	}
+	for _, issue := range assignedIssues {
+		items = append(items, selectableItem{
+			Label: fmt.Sprintf("Issue #%d  %s  (%s)", issue.Number, truncate(issue.Title, 40), issue.Repository.NameWithOwner),
+			URL:   issue.URL,
+		})
+	}
+	offerSelection(items)
 }
 
 // --- Focus: Just tell me what to do next ---
@@ -1573,6 +1614,7 @@ func cmdBlockers(repos, orgs []string, jsonOutput bool) {
 		Number      int
 		Title       string
 		Repo        string
+		URL         string
 		FailCount   int
 		HasApproval bool
 	}
@@ -1587,6 +1629,7 @@ func cmdBlockers(repos, orgs []string, jsonOutput bool) {
 				Number: pr.Number,
 				Title:  pr.Title,
 				Repo:   pr.Repository.NameWithOwner,
+				URL:    pr.URL,
 			}
 
 			out, err := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", pr.Number),
@@ -1724,6 +1767,40 @@ func cmdBlockers(repos, orgs []string, jsonOutput bool) {
 	}
 
 	fmt.Println()
+
+	// Interactive selection
+	var items []selectableItem
+	for _, s := range statuses {
+		if s.FailCount > 0 {
+			items = append(items, selectableItem{
+				Label: fmt.Sprintf("🔴 PR #%d  %s  (%s)", s.Number, truncate(s.Title, 40), s.Repo),
+				URL:   s.URL,
+			})
+		}
+	}
+	for _, s := range statuses {
+		if !s.HasApproval {
+			items = append(items, selectableItem{
+				Label: fmt.Sprintf("🟡 PR #%d  %s  (%s)", s.Number, truncate(s.Title, 40), s.Repo),
+				URL:   s.URL,
+			})
+		}
+	}
+	for _, pr := range reviewRequestedPRs {
+		items = append(items, selectableItem{
+			Label: fmt.Sprintf("👀 PR #%d  %s  (%s)", pr.Number, truncate(pr.Title, 40), pr.Repository.NameWithOwner),
+			URL:   pr.URL,
+		})
+	}
+	for i, issue := range assignedIssues {
+		if !hasLinkedPR[i] {
+			items = append(items, selectableItem{
+				Label: fmt.Sprintf("📌 Issue #%d  %s  (%s)", issue.Number, truncate(issue.Title, 40), issue.Repository.NameWithOwner),
+				URL:   issue.URL,
+			})
+		}
+	}
+	offerSelection(items)
 }
 
 func issueHasLinkedPR(repo string, number int) bool {
@@ -1807,6 +1884,53 @@ func timeAgo(ts string) string {
 
 func daysAgo(n int) string {
 	return time.Now().AddDate(0, 0, -n).Format("2006-01-02")
+}
+
+// isInteractive returns true if stdout is a terminal (not piped).
+func isInteractive() bool {
+	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+// selectableItem represents an item that can be opened in the browser.
+type selectableItem struct {
+	Label string
+	URL   string
+}
+
+// offerSelection shows an interactive select prompt and opens the chosen item.
+// Only shows when running in a terminal. Can be called repeatedly until user exits.
+func offerSelection(items []selectableItem) {
+	if !isInteractive() || len(items) == 0 {
+		return
+	}
+
+	labels := make([]string, len(items))
+	for i, item := range items {
+		labels[i] = item.Label
+	}
+
+	p := prompter.New(os.Stdin, os.Stdout, os.Stderr)
+	for {
+		idx, err := p.Select("Open", "", labels)
+		if err != nil {
+			return
+		}
+		openURL(items[idx].URL)
+	}
+}
+
+// openURL opens a URL in the default browser, cross-platform.
+func openURL(url string) {
+	// Try xdg-open (Linux), then open (macOS), then cmd (Windows)
+	for _, cmd := range [][]string{
+		{"xdg-open", url},
+		{"open", url},
+		{"cmd", "/c", "start", url},
+	} {
+		if err := exec.Command(cmd[0], cmd[1:]...).Start(); err == nil {
+			return
+		}
+	}
 }
 
 // --- Standup: What did I do? ---
