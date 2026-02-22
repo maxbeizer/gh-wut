@@ -17,7 +17,7 @@ func usage() {
 Usage:
   gh wut                        Interactive picker
   gh wut context [-R repo]      Where was I? Open PRs, issues, recent commits
-  gh wut catch-up               What happened? Notification triage
+  gh wut catch-up [-R repo]       What happened? Notification triage
   gh wut story [pr-url]         Full PR story — issue, related PRs, CI
   gh wut dashboard              Cross-repo: everything with your name on it
 
@@ -57,7 +57,7 @@ func main() {
 	case "context", "ctx":
 		cmdContext(repo)
 	case "catch-up", "catchup", "cu":
-		cmdCatchUp()
+		cmdCatchUp(repo)
 	case "story", "st":
 		pr := ""
 		if len(cleanArgs) > 1 {
@@ -102,7 +102,7 @@ func cmdPicker() {
 	case "1", "context":
 		cmdContext("")
 	case "2", "catch-up", "catchup":
-		cmdCatchUp()
+		cmdCatchUp("")
 	case "3", "story":
 		cmdStory("", "")
 	case "4", "dashboard":
@@ -242,21 +242,25 @@ type Notification struct {
 	Unread    bool   `json:"unread"`
 }
 
-func cmdCatchUp() {
+func cmdCatchUp(repo string) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
 
 	fmt.Printf("\n  %swut happened?%s\n\n", bold, reset)
 
-	out, err := exec.Command("gh", "api", "notifications?per_page=30", "--paginate").Output()
+	endpoint := "notifications?per_page=30"
+	if repo != "" {
+		endpoint = fmt.Sprintf("repos/%s/notifications?per_page=30", repo)
+	}
+	out, err := exec.Command("gh", "api", endpoint, "--paginate").Output()
 	if err != nil {
 		// Notifications API may not work with fine-grained PATs
 		fmt.Printf("  %sCouldn't fetch notifications.%s\n", dim, reset)
 		fmt.Printf("  %s(Notifications API requires classic PAT or OAuth token)%s\n\n", dim, reset)
 		fmt.Println("  Fallback: checking recent mentions...")
 		fmt.Println()
-		catchUpFallback()
+		catchUpFallback(repo)
 		return
 	}
 
@@ -318,15 +322,20 @@ func cmdCatchUp() {
 	}
 }
 
-func catchUpFallback() {
+func catchUpFallback(repo string) {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
 
-	// Search for recent mentions
 	user := ghUser()
+
+	// Search for recent mentions
+	mentionQuery := fmt.Sprintf("q=mentions:%s updated:>%s", user, daysAgo(7))
+	if repo != "" {
+		mentionQuery = fmt.Sprintf("q=mentions:%s repo:%s updated:>%s", user, repo, daysAgo(7))
+	}
 	out, err := exec.Command("gh", "api", "search/issues",
-		"-f", fmt.Sprintf("q=mentions:%s updated:>%s", user, daysAgo(7)),
+		"-f", mentionQuery,
 		"--jq", `.items[:10] | .[] | "#" + (.number|tostring) + " " + .title + " (" + .repository_url + ")"`).Output()
 	if err == nil && len(out) > 0 {
 		fmt.Printf("  %sRecent mentions:%s\n", bold, reset)
@@ -340,8 +349,12 @@ func catchUpFallback() {
 	}
 
 	// Search for PRs needing your review
+	reviewQuery := fmt.Sprintf("q=type:pr review-requested:%s state:open", user)
+	if repo != "" {
+		reviewQuery = fmt.Sprintf("q=type:pr review-requested:%s repo:%s state:open", user, repo)
+	}
 	out2, err := exec.Command("gh", "api", "search/issues",
-		"-f", fmt.Sprintf("q=type:pr review-requested:%s state:open", user),
+		"-f", reviewQuery,
 		"--jq", `.items[:10] | .[] | "#" + (.number|tostring) + " " + .title`).Output()
 	if err == nil && len(out2) > 0 {
 		fmt.Printf("\n  %sPRs awaiting your review:%s\n", bold, reset)
