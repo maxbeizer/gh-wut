@@ -11,12 +11,12 @@ Sleep 300ms
 Enter
 Sleep 3s
 
-Type "gh wut ctx -R maxbeizer/claudia"
+Type "gh wut ctx -R cli/cli"
 Sleep 300ms
 Enter
 Sleep 5s
 
-Type "gh wut story -R maxbeizer/claudia 67"
+Type "gh wut story -R cli/cli 12748"
 Sleep 300ms
 Enter
 Sleep 5s
