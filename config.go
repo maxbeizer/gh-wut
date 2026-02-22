@@ -64,6 +64,9 @@ func saveConfig(cfg Config) error {
 }
 
 func addRepo(repo string) error {
+	if err := validateRepo(repo); err != nil {
+		return err
+	}
 	cfg := loadConfig()
 	for _, r := range cfg.Repos {
 		if r == repo {

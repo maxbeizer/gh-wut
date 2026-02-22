@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,23 @@ func searchScopeArgs(repos, orgs []string) []string {
 		args = append(args, "--owner", o)
 	}
 	return args
+}
+
+var repoPattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$`)
+var orgPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+func validateRepo(repo string) error {
+	if !repoPattern.MatchString(repo) {
+		return fmt.Errorf("invalid repo format %q (expected owner/repo)", repo)
+	}
+	return nil
+}
+
+func validateOrg(org string) error {
+	if !orgPattern.MatchString(org) {
+		return fmt.Errorf("invalid org format %q", org)
+	}
+	return nil
 }
 
 var (

@@ -75,6 +75,20 @@ func main() {
 		}
 	}
 
+	// Validate inputs
+	for _, r := range repos {
+		if err := validateRepo(r); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	for _, o := range orgs {
+		if err := validateOrg(o); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+
 	// Load default repos from config if none specified via flags
 	if len(repos) == 0 {
 		repos = listRepos()
