@@ -1,11 +1,14 @@
-.PHONY: help check-go-version build run install-local relink-local test test-race coverage ci lint fmt tidy demo clean
+.PHONY: help check-go-version build run install-local relink-local test test-race coverage ci lint fmt tidy clean
 .DEFAULT_GOAL := help
 
-BINARY ?= bin/gh-wut
+# ── Change this to your extension name (without the gh- prefix) ──
+EXTENSION_NAME ?= wut
+
+BINARY ?= bin/gh-$(EXTENSION_NAME)
 GO ?= go
 GO_MIN_MAJOR ?= 1
-GO_MIN_MINOR ?= 22
-GO_MIN_PATCH ?= 5
+GO_MIN_MINOR ?= 21
+GO_MIN_PATCH ?= 0
 
 check-go-version:
 	@current="$$( $(GO) env GOVERSION 2>/dev/null | sed 's/^go//' )"; \
@@ -20,13 +23,13 @@ check-go-version:
 		exit 1; \
 	fi; \
 	if [ "$$current_major" -lt "$(GO_MIN_MAJOR)" ] || { [ "$$current_major" -eq "$(GO_MIN_MAJOR)" ] && { [ "$$current_minor" -lt "$(GO_MIN_MINOR)" ] || { [ "$$current_minor" -eq "$(GO_MIN_MINOR)" ] && [ "$$current_patch" -lt "$(GO_MIN_PATCH)" ]; }; }; }; then \
-		echo "Go $$current detected. gh-wut requires Go $(GO_MIN_MAJOR).$(GO_MIN_MINOR).$(GO_MIN_PATCH)+."; \
+		echo "Go $$current detected. gh-$(EXTENSION_NAME) requires Go $(GO_MIN_MAJOR).$(GO_MIN_MINOR).$(GO_MIN_PATCH)+."; \
 		echo "Upgrade Go and retry."; \
 		exit 1; \
 	fi
 
 help:
-	@echo "gh-wut developer commands"
+	@echo "gh-$(EXTENSION_NAME) developer commands"
 	@echo ""
 	@echo "  make build          Build ./$(BINARY)"
 	@echo "  make run            Build and run locally"
@@ -39,7 +42,6 @@ help:
 	@echo "  make lint           Run golangci-lint if installed"
 	@echo "  make fmt            Format all Go packages"
 	@echo "  make tidy           Run go mod tidy"
-	@echo "  make demo           Re-record demo.gif with VHS"
 	@echo "  make clean          Remove build artifacts"
 
 build: check-go-version
@@ -53,10 +55,10 @@ install-local:
 	gh extension install .
 
 relink-local: build
-	@if gh extension list | grep -qE '^gh wut[[:space:]]'; then \
-		gh extension remove wut; \
+	@if gh extension list | grep -qE '^gh $(EXTENSION_NAME)[[:space:]]'; then \
+		gh extension remove $(EXTENSION_NAME); \
 	fi
-	$(GO) build -o gh-wut .
+	$(GO) build -o gh-$(EXTENSION_NAME) .
 	gh extension install .
 
 test: check-go-version
@@ -84,8 +86,5 @@ fmt: check-go-version
 tidy: check-go-version
 	$(GO) mod tidy
 
-demo:
-	vhs demo.tape
-
 clean:
-	rm -rf bin coverage.out
+	rm -rf bin coverage.out gh-$(EXTENSION_NAME)
